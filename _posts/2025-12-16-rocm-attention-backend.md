@@ -121,7 +121,7 @@ The backend inherits the same KV cache layout as the standard ROCm backend: `(2,
 **AMD-Specific Optimizations**
 
 The AITER unified attention kernel incorporates several AMD-specific optimizations:
-- Hardware-aware memory access patterns optimized for AMD's Infinity Cache
+- Hardware-aware memory access patterns
 - Tuned for AMD's wavefront size and LDS (Local Data Share) usage patterns
 - Supports sink attention, thus it is compatible with GPT-OSS.
 
@@ -145,7 +145,7 @@ def rocm_aiter_unified_attention():
         layer._v_scale,
     )
 
-    # Stage 2: Single Aiter kernel call
+    # Stage 2: Single AITER kernel call
     output = unified_attention(
         q=query[:num_actual_tokens],
         k=key_cache,
@@ -499,7 +499,7 @@ def rocm_aiter_mla_decode():
         paged_kv_indptr,           # Efficient paged cache indexing
         paged_kv_indices,
         block_tables,
-        block_size=1,              # Fine-grained caching!
+        block_size=1,
         ...
     )
 
