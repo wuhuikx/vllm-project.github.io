@@ -178,17 +178,7 @@ The backend uses a KV cache layout of `(2, num_blocks, block_size, num_kv_heads,
 
 **Dual-Kernel Architecture**
 
-The backend's design centers on recognizing that prefill and decode have fundamentally different computational characteristics:
-
-**Prefill Path: Partition-Based Computation**
-
-Long prefill sequences are divided into **256-token partitions**. This partition size represents a careful balance: large enough to amortize kernel launch overhead and achieve good occupancy, yet small enough to keep memory usage predictable and bounded. Each partition is processed independently using Triton's flash attention implementation, which excels at the compute-intensive matrix multiplications required during prefill.
-
-For each partition, the kernel computes both the attention output and the LSE (log-sum-exp) values. These LSE values are critical—they enable mathematically correct merging of results from different partitions. Without proper LSE-based merging, simply averaging or concatenating partition outputs would produce incorrect attention scores.
-
-**Decode Path: Direct PagedAttention**
-
-For decode (single-token generation), the backend switches to ROCm's specialized PagedAttention kernel `torch.ops._rocm_C.paged_attention` if the head sizes are (64, 128), block sizes are (16, 32), GQA ratios are (1-16), and context up to 131k. This kernel is optimized for the memory-bound characteristics of decode: accessing a long KV cache to compute attention for just one new query token. The PagedAttention kernel uses block tables for efficient, non-contiguous memory access, allowing it to handle paged KV cache layouts without expensive memory reorganization. If the condition is not met, the fallback kernel is a triton kernel `kernel_paged_attention_2d`.
+The backend's design centers on recognizing that prefill and decode have fundamentally different computational characteristics. It utilizes a triton kernel `context_attention_fwd` to perform prefills. For decode (single-token generation), the backend switches to ROCm's specialized PagedAttention kernel `torch.ops._rocm_C.paged_attention` if the head sizes are (64, 128), block sizes are (16, 32), GQA ratios are (1-16), and context up to 131k. This kernel is optimized for the memory-bound characteristics of decode: accessing a long KV cache to compute attention for just one new query token. The PagedAttention kernel uses block tables for efficient, non-contiguous memory access, allowing it to handle paged KV cache layouts without expensive memory reorganization. If the condition is not met, the fallback kernel is a triton kernel `kernel_paged_attention_2d`.
 
 **The Partition-Based Prefill Strategy**
 
@@ -196,59 +186,48 @@ Here's how partition-based prefill works in detail:
 
 ```python
 def rocm_attn_forward():
-    if query_len == 1:
-        # Decode path: Single token generation
-        # Use ROCm's optimized PagedAttention kernel
-        output = PagedAttention.forward_decode(
-            query,              # Shape: [batch, num_heads, head_dim]
-            kv_cache,           # Paged KV cache
-            block_tables,       # Maps logical to physical blocks
-            context_lens,
+
+    if max_query_len > 1:
+        context_attention_fwd(
+            q=query,
+            k=key,
+            v=value,
+            o=output,
             ...
         )
-    else:
+
+    if use_rocm_custom_paged_attention:
         # Prefill path: Partition-based computation
         PARTITION_SIZE = 256
 
-        # Calculate number of partitions needed
-        num_partitions = (query_len + PARTITION_SIZE - 1) // PARTITION_SIZE
-
-        partial_outputs = []
-        partial_lse = []
-
-        # Process each partition independently
-        for partition_id in range(num_partitions):
-            start_idx = partition_id * PARTITION_SIZE
-            end_idx = min(start_idx + PARTITION_SIZE, query_len)
-
-            # Compute attention for this partition using Triton flash attention
-            partition_output, partition_lse = triton_flash_attn(
-                query[:, start_idx:end_idx, :],
-                key[:, start_idx:end_idx, :],
-                value[:, start_idx:end_idx, :],
-                causal=True,
-                ...
-            )
-
-            partial_outputs.append(partition_output)
-            partial_lse.append(partition_lse)
-
-        # Merge partitions using LSE values for mathematical correctness
-        # This ensures the softmax is computed correctly across all partitions
-        final_output = merge_attention_states(
-            partial_outputs,
-            partial_lse
+        max_num_partitions = (
+            max_seq_len + _PARTITION_SIZE_ROCM - 1
+        ) // _PARTITION_SIZE_ROCM
+        assert _PARTITION_SIZE_ROCM % block_size == 0
+        total_num_seq = block_table.shape[0]
+        tmp_output = torch.empty(
+            size=(total_num_seq, num_query_heads, max_num_partitions, head_size),
+            dtype=query.dtype,
+            device=output.device,
         )
 
-        # Write new KV to cache for future decode steps
-        PagedAttention.write_to_paged_cache(
-            key, value,
-            kv_cache,
-            slot_mapping,  # Maps tokens to cache locations
+        ops.paged_attention_rocm(
+            output,
+            exp_sums,
+            max_logits,
+            tmp_output,
+            query,
+            key_cache,
+            value_cache,
+            num_kv_heads,
             ...
         )
 
-        return final_output
+        return output
+    else:
+        kernel_paged_attention_2d(...)
+
+        return output
 ```
 
 **Advantages**:
@@ -592,7 +571,7 @@ if type(result) is tuple and return_softmax_lse:
 
 ## Performance Benchmark
 
-### MHA attention performance comparision
+### MHA attention performance comparisions
 ### MLA attention performance comparision
 
 
