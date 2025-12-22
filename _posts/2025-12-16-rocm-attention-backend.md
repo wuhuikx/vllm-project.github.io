@@ -97,7 +97,7 @@ def triton_unified_attention():
         output = unified_attention_3d(
             query, kv_cache,
             block_tables,
-            num_softmax_segments=16,  # Chunked softmax for memory efficiency
+            num_par_softmax_segments=16,  # Chunked softmax for memory efficiency
             ...
         )
 
